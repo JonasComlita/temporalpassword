@@ -1,114 +1,78 @@
-# Proposal: Dual-Component Paired-Secret Authentication Standard (Combined-Secret Model)
-Version: 2.0  
-Date: March 24, 2026  
-Author(s): [Your Name/Organization]
+# Temporal Password Standard
+Version: 2.1  
+Date: March 24, 2026
 
-## Abstract
-This document defines a memorized-secret authentication standard where users provide two ordered components in one login event:
+## 1. Scope
+This standard defines a dual-component memorized secret called a temporal password:
+- Ordered text groups
+- Ordered numeric intervals (`0..99`)
 
-1. Text password groups (primary component)
-2. Paired numeric codes (secondary component)
+The two components are cryptographically bound into one canonical combined secret and verified with one password hash.
 
-Unlike split-hash designs, this standard requires a **single canonical combined secret** to be derived from both components and hashed once with a slow, memory-hard algorithm (recommended: Argon2id), plus a server-side pepper stored outside the credential database (KMS/HSM/secret manager). Authentication succeeds only if the combined secret verifies.
+## 2. Secret Structure
+- Group count `M` must satisfy `8 <= M <= 64`.
+- Text groups are non-empty strings.
+- Interval list length must equal text group length.
+- Each interval is an integer in `[0, 99]`.
 
-This architecture prevents independent offline verification of each component after database compromise and forces brute-force attempts to target the full combined secret space.
+## 3. Canonical Combined Secret (Required)
+The verifier input MUST be a deterministic, unambiguous encoding of both components.
 
-## 1. Problem Statement and Rationale
-Single-string passwords remain vulnerable to weak user choices, reuse, and offline cracking after database theft. Split-hash dual-secret approaches improve structure but still expose independent verification oracles for each component.
+Reference encoding:
+- Group encoding: length-prefixed (`len:text` concatenation)
+- Interval encoding: colon-separated values
+- Final format:
 
-This standard keeps the two-component UX while binding both components into a single cryptographic verifier, increasing attacker workload in offline scenarios compared to independent component hashes.
+`g:{M}|{encoded_groups}|t:{M}|{encoded_intervals}`
 
-## 2. Core Concepts
-- `Password Group`: A non-empty text segment entered by the user.
-- `Numeric Code`: A paired integer (0-99) linked by position to a password group.
-- `Dual-Component Secret`: Two ordered lists of equal length: password groups and numeric codes.
-- `Canonical Combined Secret`: A deterministic, unambiguous serialization of both ordered lists used as the sole KDF input.
+Example:
+`g:3|2:ab1:Z3:cat|t:3|12:0:99`
 
-## 3. Technical Specification
-### 3.1 Data Structure and Constraints
-- Password groups: ordered list length `M`, where `8 <= M <= 64`
-- Numeric codes: ordered list length `M`, where each code is an integer `0..99`
-- Both lists must have identical length and preserve order
-
-### 3.2 Canonical Encoding
-Implementations MUST serialize to one unambiguous string before hashing.
-
-Recommended format:
-- Text groups: length-prefixed encoding for each group
-- Numeric list: delimiter-separated or fixed-width encoding
-- Include section labels and list length
-
-Example canonical template:
-`g:{M}|{encoded_groups}|t:{M}|{encoded_codes}`
-
-Where:
-- `encoded_groups` might be `len:text` repeated (e.g., `2:ab1:c`)
-- `encoded_codes` might be `12:08:05:99`
-
-### 3.3 Secure Storage
-The verifier MUST be produced from the canonical combined secret only.
-
-Required:
-1. Derive canonical combined secret from submitted components.
-2. Prepend/derive pepper material (server-side secret, not in DB).
-3. Hash using Argon2id with tuned memory/time/parallelism settings.
-4. Store a single hash verifier string (including algorithm params/salt as supported by the hasher).
+## 4. Storage and Verification
+- Store one verifier only: `combined_secret_hash`.
+- Hash using a slow password KDF (Argon2id in production).
+- Apply a server-side pepper from secret management (not from the user DB).
+- Authenticate by recomputing the canonical combined secret and verifying it against the stored hash.
 
 Prohibited:
-- Storing plaintext components
-- Reversible encryption as primary verifier
-- Storing independent hash verifiers for primary and secondary components
+- Separate stored hashes for text and interval components.
+- Plaintext or reversible storage of either component.
 
-### 3.4 Verification Protocol
-1. Client sends both ordered components in one authentication request.
-2. Server reconstructs canonical combined secret.
-3. Server verifies against stored single combined verifier using constant-time comparison path from the password hasher.
-4. Return generic failure on mismatch.
+## 5. Temporal Online Challenge Flow (Required)
+To preserve temporal semantics and improve online resistance, login uses a challenge flow:
 
-## 4. Security Analysis
-### 4.1 Offline Attack Model
-With a single combined verifier, the attacker has only one oracle:
-- `is_combined_secret_correct(primary, secondary)?`
+1. `POST /temporal/challenge/start`
+- Input: username
+- Output: `challenge_id`, expiry, constraints
 
-They cannot independently test primary or secondary components in isolation from the credential DB alone.
+2. `POST /temporal/challenge/submit`
+- Input: `challenge_id`, one `{text, time}` pair, optional `finalize`
+- Server stores incremental progress in short-lived cache.
+- Server enforces timing between submissions:
+  - Required elapsed time before next submit is based on the previous submitted interval.
+  - Policy: `expected_wait = previous_interval * INTERVAL_UNIT_SECONDS`
+  - Accepts configurable tolerance.
+- If submitted too early, return `429 temporal_too_fast`.
 
-### 4.2 Numeric Component Entropy
-For `M` groups and codes in `0..99`, numeric combinations are:
-- `100^M`
+3. Finalize
+- Finalize requires at least 8 groups.
+- On finalize, server runs full combined-secret verification.
+- Generic failure responses are required.
 
-Examples:
-- `M=8`: `100^8 = 10^16` (about 53 bits)
-- `M=12`: `100^12 = 10^24` (about 80 bits)
+Note: This timing control is implemented as non-blocking policy checks, not server `sleep()` delays.
 
-Total resistance is determined by combined-secret entropy, user choice quality, and KDF cost settings.
+## 6. Account Security Requirements
+- IP rate limits on challenge start and submit endpoints.
+- Account lockout after repeated failed final verifications.
+- Generic credential failure responses.
+- Audit logging for failed and successful authentication events.
 
-### 4.3 Pepper Benefits
-If DB is stolen but pepper remains protected in KMS/HSM/secret manager, attackers cannot directly validate guesses from DB contents alone. Pepper compromise collapses this benefit, so key management and rotation policy are critical.
+## 7. Lifecycle Rules
+- Enrollment creates a full new paired secret (both components).
+- Rotation replaces the full paired secret as one unit.
+- Recovery invalidates old verifier and requires full re-enrollment of both components.
 
-### 4.4 Online Attack Mitigations (Required)
-- IP and account rate limiting
-- Progressive lockouts or cooldowns
-- Generic error responses
-- Auditing and anomaly detection
-
-## 5. Usability and Client UX
-The UI should guide users through group/code pairs step-by-step while preserving order. The backend remains stateless and verifies only on complete submission.
-
-Usability hypothesis: pair-based secrets may be easier for some users to memorize than a single highly complex random string of equivalent entropy. This should be validated with user testing.
-
-## 6. Identity Lifecycle
-- Enrollment: user sets both components together.
-- Rotation: user replaces full dual-component secret as one unit.
-- Recovery: reset invalidates the old verifier and requires creation of a full new dual-component secret.
-
-## 7. Relationship to NIST SP 800-63B
-This is still a single-factor memorized secret (`something you know`), not MFA. It is a structured memorized-secret scheme intended to improve offline resistance versus naive single-string and split-hash paired-secret designs.
-
-## 8. Minimum Compliance Checklist
-- Single combined verifier per account for temporal auth
-- Canonical encoding is deterministic and unambiguous
-- Argon2id in production
-- Server-side pepper from external secret management
-- Rate limiting and lockout controls enabled
-- Generic auth error responses
-- Full-credential reset and rotation flow
+## 8. Security Notes
+- Temporal timing checks primarily strengthen online attack cost/control.
+- Offline resistance comes from combined-secret hashing, Argon2id cost, salts, and pepper protection.
+- This remains a single-factor memorized secret (knowledge factor), not MFA.
